@@ -1,50 +1,48 @@
+# app/main.py
+# Entry point for FastAPI. Verifies secret and invokes solver.
 import asyncio
-# Ensure the Windows Proactor event loop is used so subprocesses (Playwright browsers) work.
-# This must be set before any asyncio event loop is created or before uvicorn imports this module.
+# Ensure Windows Proactor event loop policy for subprocess support on Windows dev machines
 try:
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-except AttributeError:
-    # Not on Windows / policy not available — ignore
+except Exception:
     pass
+
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from app.config import SECRET
 from app.solver import handle_quiz_request
-import asyncio
-import json
-import logging
-import traceback
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LLM Analysis Quiz Endpoint")
 
+
 @app.post("/task")
 async def task_endpoint(request: Request):
+    """
+    Endpoint required by the project.
+    - Expects JSON with keys: email, secret, url
+    - Returns HTTP 200 if secret matches (spec requirement).
+    """
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # verify required fields
     if not isinstance(payload, dict) or "email" not in payload or "secret" not in payload or "url" not in payload:
         raise HTTPException(status_code=400, detail="Missing fields: email, secret, url required")
 
     if str(payload.get("secret")) != str(SECRET):
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # valid request -> spawn worker to handle quiz synchronously here
-    # Because evaluation expects that your endpoint will visit the URL and submit the correct answer within 3 minutes,
-    # we perform the work before sending the 200 response (so their test sees 200).
-    # However to keep the endpoint responsive we run the worker with a timeout guard.
     try:
-        result = await asyncio.wait_for(handle_quiz_request(payload), timeout=None)
-    except asyncio.TimeoutError:
-        # If our worker times out, inform them with HTTP 500 or similar. But spec says respond 200 if secret matches -
-        # so still return 200 here and include an error field.
-        return JSONResponse(status_code=200, content={"status": "timeout", "detail": "handler timed out"})
-    except Exception as e:
-        logging.exception("Exception while handling quiz request")   # prints full traceback
-        tb = traceback.format_exc()
-        # include the traceback in the response (temporary for debugging only)
-        return JSONResponse(status_code=200, content={"status": "error", "detail": tb})
+        # Run the quiz handler. We run within asyncio and the solver uses asyncio.to_thread
+        result = await handle_quiz_request(payload)
+    except Exception:
+        # Log the traceback to make it visible in provider logs
+        logger.exception("Exception while handling quiz request")
+        return JSONResponse(status_code=200, content={"status": "error", "detail": "internal error (see logs)"})
 
     return JSONResponse(status_code=200, content={"status": "ok", "result": result})
